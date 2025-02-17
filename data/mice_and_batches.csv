@@ -1,0 +1,14 @@
+mouse_id,genotype_detailed,genotype,batch
+1004,ctrl_ko,ctrl,A
+1005,ko,ko,A
+1006,ctrl_ko,ctrl,A
+1007,ko,ko,A
+1014,ctrl_ko_bmt,ctrl,B
+1015,ctrl_ko_bmt,ctrl,B
+1016,ko_bmt,ko_bmt,B
+1017,ko_bmt,ko_bmt,B
+1030,ctrl_ei,ctrl,C
+1031,ctrl_ei,ctrl,C
+1032,ctrl_ei,ctrl,C
+1033,ei,ei,C
+1034,ei,ei,C

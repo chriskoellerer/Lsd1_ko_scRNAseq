@@ -1,0 +1,511 @@
+---
+---
+---
+
+# Script 01: Pre-Processing
+
+Steps involved:
+
+i.  sample-specific QC (by MAD)
+ii. ambient RNA detection & removal
+iii. doublet detection
+
+```{r}
+library(Seurat)
+library(dplyr)
+library(patchwork)
+library(ggplot2)
+library(SoupX)
+```
+
+Load a couple of helper functions:
+
+```{r}
+source("R/plotting.R")
+source("R/quickndirty_helpers.R")
+```
+
+# Inputs
+
+Current sample_id:
+
+```{r}
+current_sample <- "1015"
+```
+
+nMADs to use as cutoff:
+
+```{r}
+mad_cut = 5
+```
+
+Paths:
+
+```{r}
+# data:
+data_path <- file.path("..", "data", "cellranger", current_sample, "outs")
+# results:
+results_path <- file.path("01_preprocess", current_sample)
+if(!dir.exists(results_path)){
+  dir.create(results_path, recursive = TRUE)
+}
+# storage for new desoupd counts matrix:
+desoupd_path <- file.path(results_path, "soupx")
+if(!dir.exists(desoupd_path)){
+  dir.create(desoupd_path, recursive = TRUE)
+}
+```
+
+Keep some canonical marker genes around for sanity checks & to inspect quality of ambient RNA removal. Caution: manual estimation of contamination fraction in SoupX with these markers tends to lead to over-correction
+
+```{r}
+# EXCLUSIVE marker genes 
+T_genes = c("Cd3d", "Cd3e", "Cd3g", "Ccl5")
+B_genes = c("Cd79a", "Cd19", "Pax5", "Ebf1")
+neutro_genes = c("Cd177", "Ltf", "Camp", "Ngp")
+act_neutro_genes = c( "Mmp9", "Retnlg", "Csf3r")
+ery_genes = c("Hba-a2", "Hbb-bs", "Hbb-bt", "Alas2", "Hba-a1")
+dend_genes = c("Siglech", "Clec9a")
+mono_genes = c("Ccr2", "Csf1r", "Cd14", "Cx3cr1") 
+
+ExclusiveGenesList = list(
+  T_cells = T_genes,
+  B_cells = B_genes,
+  neutro = neutro_genes,
+  act_neutro = act_neutro_genes,
+  ery = ery_genes,
+  dend = dend_genes,
+  mono = mono_genes
+  )
+```
+
+Cell cycle genes for cell cycle scoring (origin: <https://github.com/hbc/tinyatlas/blob/master/cell_cycle/Mus_musculus.csv> -\> ensembl biomart for symbols)
+
+```{r}
+# load cell cycle genes
+s_genes <- read.csv("../metadata/cell_cycle/mart_export_s.txt") %>% pull(3)
+g2m_genes <- read.csv("../metadata/cell_cycle/mart_export_g2m.txt") %>% pull(3)
+
+```
+
+# Filtering
+
+```{r}
+# filtered counts
+filtered <- Read10X_h5(file.path(data_path, "filtered_feature_bc_matrix.h5"))
+# stick it with appropriate DKFZ projectID & sampleID
+colnames(filtered) <- gsub(
+  "-1$", 
+  paste0("-EPIG_A07_", current_sample), 
+  colnames(filtered))
+```
+
+Load metadata from exploratory first pass analysis with old cellranger output. The initial cell labels I assigned will prove useful
+
+```{r}
+unsouped_meta <- read.csv(file.path("results", "old_results", "FULL_metadata_with_labels", "metadata.csv"),
+                          row.names = 1) %>%
+  filter(mouse_id == current_sample) %>%
+  select(cell_type_merged) 
+
+colnames(unsouped_meta) <- "old_label"
+```
+
+Create Seurat object
+
+```{r}
+seurat_obj <- CreateSeuratObject(filtered)
+seurat_obj <- AddMetaData(
+  seurat_obj,
+  metadata = unsouped_meta
+  )
+```
+
+Tag outliers by a) % mitochondrial reads b) log(total counts) and c) log(distinct feature counts). This type of filtering is inspired by <https://www.sc-best-practices.org> :
+
+```{r}
+# add QC info
+seurat_obj$percent.mt <- PercentageFeatureSet(seurat_obj, pattern = "^mt")
+seurat_obj$log1p_n_genes_by_counts <- log1p(seurat_obj$nFeature_RNA)
+seurat_obj$log1p_total_counts <- log1p(seurat_obj$nCount_RNA)
+
+# define metrics
+metrics_to_tag <- list(
+  c("log1p_total_counts", "counts_outlier"),
+  c("log1p_n_genes_by_counts", "features_outlier"),
+  c("percent.mt", "mito_outlier")
+)
+
+# loop through metrics
+for (pair in metrics_to_tag) {
+  metric <- pair[[1]]
+  new_col <- pair[[2]]
+  index <- mad_tagging(seurat_obj, metric, mad_cut)
+  seurat_obj[[new_col]] <- ifelse(index, "yes", "no")
+}
+```
+
+```{r}
+# scatter + mito outliers
+FeatureScatter(
+  seurat_obj,
+  "log1p_total_counts",
+  "log1p_n_genes_by_counts",
+  group.by = "mito_outlier")
+```
+
+```{r}
+# scatter + labels
+FeatureScatter(
+  seurat_obj,
+  "log1p_total_counts",
+  "log1p_n_genes_by_counts",
+  group.by = "old_label")
+```
+
+-\> As suspected, a lot of these outliers are actually bona fide erythrocytes (which have lower transcriptional complexity)
+
+Get some quick clusters for inspection
+
+```{r}
+# run quickndirty clusters
+seurat_obj <- run_standard_seurat(
+  seurat_obj, 
+  npcs = 30)
+```
+
+Locate those outliers:
+
+```{r, message=FALSE, warning=FALSE}
+# outlier position
+save_dimplot(object = seurat_obj,
+             reduction = "umap",
+             category = c("counts_outlier","features_outlier", "mito_outlier"),
+             title = "unfiltered_mad_outliers",
+             folder = results_path,
+             num_columns = 2,
+             output_formats = "jpg")
+```
+
+Those are some tightly clustered outliers -\> let's remove 'em
+
+```{r}
+# remove mito outliers
+seurat_subset <- subset(
+  seurat_obj,
+  subset = mito_outlier != "yes")
+```
+
+SoupX results are improved by providing cluster information, lets run it again on the cleaned object for good measure (probably wont change much)
+
+```{r}
+seurat_subset <- run_standard_seurat(
+  seurat_subset, 
+  npcs = 30)
+```
+
+Inspect results:
+
+```{r, message=FALSE, warning=FALSE}
+# dimplot overview
+save_dimplot(object = seurat_subset,
+             reduction = "umap",
+             category = c("seurat_clusters",
+                          "old_label"),
+             title = "overview",
+             num_columns = 2,
+             folder = results_path,
+             output_formats = "jpg")
+```
+
+Get expression patterns for some cell type markers before altering the count matrix:
+
+```{r, message=FALSE, warning=FALSE}
+
+# run this entire lapply for all markers:
+
+# lapply(names(ExclusiveGenesList), function(genes) {
+#   save_featureplot_big(
+#     seurat_subset,
+#     features = ExclusiveGenesList[[genes]],
+#     title = paste0(genes, "_featurePlot"),
+#     folder = results_path,
+#     output_formats = "jpg")
+# }
+# )
+
+# ery markers as example:
+save_featureplot_big(
+  seurat_subset,
+  features = ExclusiveGenesList[["ery"]],
+  title = paste0("ery", "_featurePlot"),
+  folder = results_path,
+  output_formats = "jpg"
+)
+```
+
+-\> there's clear hemoglobin expression in places where it shouldnt be. Makes sense since the samples were submitted to RBC lysis. A rationale to apply ambient RNA correction
+
+# SoupX
+
+NB: some of this code is straight from the SoupX vignette at <https://cran.r-project.org/web/packages/SoupX/vignettes/pbmcTutorial.html>
+
+Load raw droplet data for background estimation of the soup:
+
+```{r}
+# raw droplets (for SoupX)
+raw <- Read10X_h5(file.path(data_path,  "raw_feature_bc_matrix.h5"))
+colnames(raw) <- gsub(
+  "-1$", 
+  paste0("-EPIG_A07_", current_sample), 
+  colnames(raw))
+```
+
+Set up soup channel and update it with clusters & UMAP coordinates:
+
+```{r}
+
+# update initial feature-BC matrix for filtered cell subset
+filtered_subset <- filtered[, colnames(filtered) %in% colnames(seurat_subset)]
+
+# initiate soup channel
+sc <- SoupChannel(raw, filtered_subset) # calcSoupProfile = FALSE in case you want to estimateSoup() manually
+
+# make sure it overaps with seurat object for cluster transfer etc
+stopifnot(identical(colnames(sc$toc), colnames(seurat_subset)))
+
+# print top 100 contaminants for inspection
+write.csv(head(sc$soupProfile[order(sc$soupProfile$est, decreasing = TRUE), ], n = 100),
+          file.path(results_path, "top100_soup_ingredients.csv"))
+
+# transfer seurat clusters
+sc = setClusters(sc, 
+                 setNames(seurat_subset$seurat_clusters, 
+                          rownames(seurat_subset@meta.data)))
+
+# transfer embedding
+sc = setDR(sc, 
+           seurat_subset@reductions$umap@cell.embeddings[colnames(sc$toc), c("umap_1", "umap_2")])
+
+```
+
+Optional: perform initial estimation with manual markers (will NOT be used for correction):
+
+```{r}
+# add markers
+useToEst = estimateNonExpressingCells(sc, 
+                                      nonExpressedGeneList = ExclusiveGenesList)
+```
+
+```{r}
+# optional: plot all markers
+
+# # plot markers (and reciprocally cells used for BG estimation)
+# lapply(names(ExclusiveGenesList), function(name){
+#   plotMarkerMap(sc,
+#                 geneSet = ExclusiveGenesList[[name]],
+#                 useToEst = useToEst[, name])
+#   ggsave(file.path(results_path, paste0("MarkerMap_", name, ".jpg")))
+# })
+
+# exemplary: ery markers
+  plotMarkerMap(sc,
+                geneSet = ExclusiveGenesList[["ery"]],
+                useToEst = useToEst[, "ery"])
+```
+
+```{r, message=FALSE, warning=FALSE}
+plotMarkerDistribution(sc,
+                       ExclusiveGenesList)
+```
+
+-\> Ery and neutro marker genes really show a low observed/expected ratio in most cells with a small population defying the counts expected if the cells were only made of soup -\> this confirms the initial suspicion of contaminating neutro/ery reads.
+
+Optional: log manual estimation of contamination
+
+```{r}
+# calculate contamination %
+sc = calculateContaminationFraction(sc, 
+                                    ExclusiveGenesList, 
+                                    useToEst = useToEst)
+
+# log results
+log_cont <- file.path(results_path,"log_contamination_estimates.txt")
+sink(log_cont)
+"Manual estimation:"
+print(sc$metaData$rho %>% mean())
+sink()
+```
+
+Automated estimation (WILL be used for estimation):
+
+```{r, message=FALSE, warning=FALSE}
+sc = autoEstCont(sc)
+
+# log the result
+sink(log_cont,
+     append = TRUE)
+"Automated estimation:"
+print(sc$fit$rhoEst)
+sink()
+```
+
+De-contamination:
+
+```{r}
+
+# adjust the counts based on estimated contamination
+out = adjustCounts(sc,
+                   roundToInt = TRUE)
+
+```
+
+Inspect some results from the operation:
+
+```{r}
+# extract most zeroed counts (code from vignette)
+cntSoggy = rowSums(sc$toc > 0)
+cntStrained = rowSums(out > 0)
+mostZeroed = tail(sort((cntSoggy - cntStrained)/cntSoggy), n = 200)
+write.csv(
+  as.data.frame(mostZeroed) %>%
+            arrange(desc(mostZeroed)),
+  file.path(results_path,"top200_removed_genes.csv"))
+```
+
+```{r}
+
+# plot some %soup
+# for (gene in c("Camp", "Mmp9", "Hba-a2", "Cd79a", "Cd3d", "Prtn3", "Cd34")){
+#   plotChangeMap(sc,
+#                 out,
+#                 gene)
+#   ggsave(file.path(results_path, paste0("ChangeMap_", gene, ".jpg")))
+# }
+
+# plot some %soup for erys
+plotChangeMap(sc,
+              out,
+              "Hba-a2")
+```
+
+-\> None of the hemoglobin alpha reads were removed in erythroid cells, while the majority of them were removed from non-erythroid cells
+
+# Doublet flagging
+
+```{r}
+
+library(scDblFinder)
+
+# create sce from spare matrix
+sce <- SingleCellExperiment(
+  list(counts = out))
+
+# detect doublets (I chose cluster = FALSE)
+sce <- scDblFinder(sce)
+```
+
+# Final inspection & save results
+
+Create Seurat object from de-soupd counts
+
+```{r}
+seurat_desoupd <- CreateSeuratObject(out,
+                                     meta.data = seurat_subset@meta.data)
+# normalize to plot gene expression
+seurat_desoupd <- NormalizeData(seurat_desoupd)
+```
+
+Transfer UMAP & doublet metadata
+
+```{r}
+seurat_desoupd[["umap"]] <- CreateDimReducObject(
+  embeddings = seurat_subset@reductions$umap@cell.embeddings,
+  key = "umap_")
+
+# transfer doublets
+stopifnot(identical(colnames(sce), colnames(seurat_desoupd)))
+seurat_desoupd$scDblFinder.class <- sce$scDblFinder.class
+seurat_desoupd$scDblFinder.score <- sce$scDblFinder.score
+```
+
+Inspect doublet locations:
+
+```{r, message=FALSE, warning=FALSE}
+# doublets overview
+save_dimplot(object = seurat_desoupd,
+             reduction = "umap",
+             category = "scDblFinder.class",
+             num_columns = 1,
+             folder = results_path,
+             output_formats = "jpg")
+```
+
+-\> no cluster enriched for doublets. I will leave them in for now, all non-ery/non-neutro cells are precious for creating a reference map.
+
+Check log-normalized expression of de-soupd marker genes:
+
+```{r, message=FALSE, warning=FALSE}
+# # desoupd markers overview
+# lapply(names(ExclusiveGenesList), function(genes) {
+#   save_featureplot(
+#     seurat_desoupd,
+#     features = ExclusiveGenesList[[genes]],
+#     title = paste0("CLEANED_", genes, "_featurePlot"),
+#     folder = results_path,
+#     output_formats = "jpg")
+# }
+# )
+
+# one ery marker
+ save_featureplot_big(
+    seurat_desoupd,
+    features = ExclusiveGenesList[["ery"]],
+    title = paste0("CLEANED_", "ery", "_featurePlot"),
+    folder = results_path,
+    output_formats = "jpg")
+```
+
+-\> much better than before, while erythroid expression levels are conserved.
+
+For QC completion's sake, perform cell cycle scoring:
+
+```{r}
+seurat_desoupd <- CellCycleScoring(seurat_desoupd,
+                                   s.features = s_genes,
+                                   g2m.features = g2m_genes)
+```
+
+```{r, message=FALSE, warning=FALSE}
+save_dimplot(object = seurat_desoupd,
+             reduction = "umap",
+             category = c("Phase"),
+             num_columns = 1,
+             folder = results_path,
+             output_formats = "jpg")
+```
+
+-\> looks reasonable: stem and progenitors are show signs of cycling, the rest enriched for G1
+
+Save the filtered & corrected sample data:
+
+```{r}
+# clean before saving
+seurat_desoupd[["RNA"]]@layers$data <- NULL
+
+# save seurat obj
+saveRDS(
+  seurat_desoupd,
+  file.path(desoupd_path, paste0(current_sample, ".rds"))
+)
+
+# as well as components for scanpy access
+save_seurat_comps(seurat_desoupd,
+                  save_path = desoupd_path)
+```
+
+# Rinse & repeate for additional samples
+
+```{r}
+gc()
+```
