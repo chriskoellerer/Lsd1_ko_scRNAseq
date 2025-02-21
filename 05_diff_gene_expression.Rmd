@@ -1,0 +1,386 @@
+---
+---
+---
+
+# Script 05: Differential Gene Expression analysis
+
+Steps involved:
+
+i.  DEGs on cell-level data
+
+ii. Heatmaps of log-normalized z-scaled counts
+
+iii. DEGs on pseudosample-level data
+
+```{r, message=FALSE, warning=FALSE}
+library(Seurat)
+library(dplyr)
+library(patchwork)
+library(ggplot2)
+library(ComplexHeatmap)
+library(RColorBrewer)
+library(edgeR)
+```
+
+Load a couple of helper functions:
+
+```{r}
+source("R/plotting.R")
+source("R/quickndirty_helpers.R")
+```
+
+Paths:
+
+```{r}
+# path to full integration result (04) in the form of a seurat object:
+data_path <- file.path("results", "29_REVIEW_integrated_final_label", "29_reviewed_integrated_object.rds")
+# results:
+results_path <- file.path("05_DEGs")
+if(!dir.exists(results_path)){
+  dir.create(results_path, recursive = TRUE)
+}
+```
+
+# Cell-level DEGs (Wilcoxon rank-sum)
+
+Load the integrated object
+
+```{r}
+seurat_obj <- readRDS(data_path)
+seurat_obj <- NormalizeData(seurat_obj)
+```
+
+### Run pairwise comparisons for the aberrant vs non-aberrant populations
+
+```{r}
+
+Idents(seurat_obj) <- seurat_obj$final_label
+
+# pairs of interest
+pairs <- list(
+  c("GMPs (granulocytic)-like", "GMPs (granulocytic)"),
+  c("Promonocytes-like", "Promonocytes"),
+  c("Monocytes-like", "Monocytes")
+  )
+
+# run findmarkers over list
+results_list <- lapply(
+  pairs,
+  find_markers_for_pair,
+  seurat_obj = seurat_obj,
+  gene_of_interest = "Prtn3",
+  min_pct = 0.25,
+  min_diff_pct = 0.1,
+  out_dir = file.path(results_path, "marker_outputs")
+  ) 
+```
+
+```{r}
+print(head(results_list[[2]], n = 10))
+```
+
+### Run pairwise comparisons in (shared) HSPCs for the different genotypes
+
+```{r}
+# subset for only hspcs
+subset_hspc <- subset(
+  seurat_obj,
+  subset = overall_class == "shared HSPCs"
+  )
+
+Idents(subset_hspc) <- subset_hspc$genotype
+
+# get genotype pairs
+pairs <- combn(
+  unique(subset_hspc$genotype), 
+  2, 
+  simplify = FALSE
+  )
+
+# run findmarkers over pairs
+results_list_hspc <- lapply(
+  pairs,
+  find_markers_for_pair,
+  seurat_obj = subset_hspc,
+  gene_of_interest = "Prtn3",
+  min_pct = 0.25,
+  min_diff_pct = 0.1,
+  out_dir = file.path(results_path, "marker_outputs_HSPC")
+)
+```
+
+### Draw heatmaps
+
+Select celltypes to compare:
+
+```{r}
+# I'll run with HSPCs: ko vs ctrl for this example
+cell_types <- c("shared HSPCs")
+current_comp <- "HSPCs_by_genotype"
+current_markers <- results_list_hspc[[2]]
+```
+
+Select wether to clamp outier values (by q5 / q95):
+
+```{r}
+clip <- TRUE
+upper_q = 0.95
+lower_q = 0.05
+```
+
+Get count matrix for top20 markers and cells of interest:
+
+```{r}
+# boolean indexing (seurat subset() causes problems since v5 for me)
+genes_idx <- rownames(seurat_obj) %in% rownames(current_markers[1:10,])
+cell_idx <- seurat_obj$overall_class %in% cell_types # use final_label column for aberrant vs non-aberrant
+
+# get matrix
+mat <- seurat_obj[["RNA"]]@layers$data[genes_idx, cell_idx] %>% 
+  as.matrix()
+
+# rename dimensions
+rownames(mat) <- rownames(seurat_obj)[genes_idx]
+colnames(mat) <- colnames(seurat_obj)[cell_idx]
+
+# feature z-scaling 
+mat <- t(scale(t(mat)))
+
+# OPTIONAL: clip outliers
+if(clip){
+  lower_cap <- quantile(mat, lower_q)
+  upper_cap <- quantile(mat, upper_q)
+}
+mat[mat < lower_cap] <- lower_cap
+mat[mat > upper_cap] <- upper_cap
+
+```
+
+Construct heatmap:
+
+```{r, message=FALSE, warning=FALSE}
+top_anno <- HeatmapAnnotation(
+  df = seurat_obj@meta.data %>%
+    filter(cell_idx) %>%
+    select(genotype)
+  )
+
+ht <- Heatmap(mat, 
+              name = "z-scaled log+1",
+              #column_split = factor(separation),
+              cluster_column_slices = FALSE,
+              column_title_gp = gpar(fontsize = 16),
+              show_column_dend = FALSE,
+              #column_gap = unit(0.5, "mm"),
+              cluster_columns = FALSE,
+              cluster_rows = TRUE,
+              show_row_dend = TRUE,
+              col = rev(brewer.pal(n = 9, name = "RdBu")),
+              row_names_gp = gpar(fontsize = 12),
+              top_annotation = top_anno,
+              show_column_names = FALSE,
+              use_raster = TRUE,
+              raster_quality = 4)
+
+draw(ht)
+# pdf(file.path(results_path, paste0(current_comp, "_top10.pdf")),
+#     width = std_width,
+#     height = std_height)
+# dev.off()
+```
+
+# Pseudo-bulk analyses of HSPCs
+
+scRNA-seq DEG calling can be prone to false positives. Pseudobulk analyses have been shown to be more robust, with likelihood ratio testing performing best. We will enhance our DEG calling in the case of HSPCs by aggregating pseudosamples (1 sample = 1 murine donor) and testing for significance using edgeR-LRT. This code can be adapted for other cell type comparisons
+
+### Wrangle counts & metadata
+
+Count cells & aggregate:
+
+```{r}
+# track cell numbers
+cell_counts_hspcs <- subset(
+  seurat_obj@meta.data, 
+  overall_class == "shared HSPCs") %>%
+  group_by(genotype, mouse_id) %>%
+  summarise(n_cells = n(), .groups = "drop") %>%
+  mutate(sample_id = as.character(mouse_id))
+
+# aggregate read counts
+agg_hspcs <- AggregateExpression(
+  subset(seurat_obj,
+         subset = overall_class == "shared HSPCs"),
+  group.by = c("genotype", "mouse_id"))$RNA
+```
+
+```{r}
+print(dim(agg_hspcs))
+```
+
+Create sample-level metadata table:
+
+```{r}
+# initiate df
+samples_df <- data.frame()
+
+# populate df
+samples_df = data.frame(
+  sample_id = stringr::str_split_fixed(colnames(agg_hspcs), "_", 2)[,2],
+  condition = stringr::str_split_fixed(colnames(agg_hspcs), "_", 2)[,1]
+  ) %>% 
+  left_join(
+    cell_counts_hspcs %>%
+      select(-mouse_id, -genotype), 
+    by = c("sample_id")) %>%
+  # CELL NUMBER THRESHOLD = 20
+  mutate(qc_pass = ifelse(
+    n_cells >= 20, 
+    "yes", 
+    "no"))
+
+# save HSPC pseudobulk information
+write.csv(
+  samples_df,
+  file.path(results_path, "sample_table_HSPCs.csv"),
+  row.names = FALSE)
+
+print(samples_df)
+```
+
+Filter pseudosamples for n \>= 20:
+
+```{r}
+samples_df_filtered <- samples_df %>%
+  filter(qc_pass == "yes")
+```
+
+### Run edgeR
+
+The final comparison we're interested in are the combined ko and ko_bmt HSPCs vs healthy controls:
+
+```{r}
+current_comparison <- "HSPC_ko_ko_bmt"
+
+# subset sample data
+current_samples <- samples_df_filtered %>%
+  filter(condition != "ei") %>%
+  mutate(paste = paste0(condition, "_", sample_id)) %>%
+  mutate(condition = ifelse(
+    condition == "ctrl", 
+    "ctrl", 
+    "ko_or_bmt"))
+
+# subset counts
+current_counts <- agg_hspcs[, colnames(agg_hspcs) %in% current_samples$paste]
+stopifnot(colnames(current_counts) == current_samples$paste)
+```
+
+Create edgeR object & filter for meaningful genes:
+
+```{r}
+y <- DGEList(counts = current_counts, 
+             samples = current_samples)
+# filter by log-cpm threshold based on smallest treatment group
+keep <- filterByExpr(y, 
+                     group=current_samples$condition)
+
+y <- y[keep,]
+```
+
+Normalize for library size by TMM method:
+
+```{r}
+y <- normLibSizes(y)
+```
+
+Inspect built-in multidiemensional scaling plots
+
+```{r}
+condition <- as.factor(y$samples$condition)
+#png(file.path(results_path, paste0("MDS_plot_", current_comparison, ".png")))
+plotMDS(y, pch=16, col=c(2:8)[condition], main="MDS")
+legend("bottomleft", 
+       legend=paste0("condition",levels(condition)),
+       pch=16,
+       col=2:8, 
+       cex=0.8)
+#dev.off()
+```
+
+Fit a GLM:
+
+```{r}
+
+# design matrix
+design <- model.matrix(~0 + condition, 
+                       data = current_samples)
+colnames(design) <- gsub("condition", "", colnames(design))
+
+# estimate dispersion
+# nb: consider estimateGLMRobustDisp if heavy outliers
+y <- estimateDisp(y,
+                  design,
+                  robust = TRUE)
+
+# fit glm
+fit <- glmFit(y, 
+              design, 
+              robust=TRUE)
+```
+
+Pairwise LRT testing:
+
+```{r}
+
+conditions <- levels(factor(current_samples$condition))
+
+# personal preference: reverse alphabetical factor order
+conditions <- rev(conditions)
+
+# initiate list
+results_list <- list()
+
+# nested loop for pairwise testing
+for (i in 1:(length(conditions) - 1)) {
+  for (j in (i + 1):length(conditions)) {
+    # define pairs
+    condition1 <- conditions[i]
+    condition2 <- conditions[j]
+    
+    # define contrast
+    contrast <- numeric(ncol(design))
+    contrast[which(colnames(design) == condition1)] <- 1
+    contrast[which(colnames(design) == condition2)] <- -1
+    
+    # testing with LRT
+    lrt <- glmLRT(fit, contrast = contrast)
+    
+    # get results
+    results <- topTags(lrt, n = Inf)$table
+    
+    # save to list
+    comparison_name <- paste0(condition1, "_vs_", condition2)
+    results_list[[comparison_name]] <- results
+    
+    # save to csv, including UP / DOWN subsets
+    write.csv(
+      results, 
+      file.path(results_path, paste0(comparison_name, "_ALL.csv"))
+      )
+    write.csv(
+      results %>%
+        filter(logFC > 0), 
+      file.path(results_path, paste0(comparison_name, "_UP.csv"))
+      )
+    write.csv(
+      results %>%
+        filter(logFC < 0), 
+      file.path(results_path, paste0(comparison_name, "_DOWN.csv"))
+    )
+  }
+}
+```
+
+```{r}
+print(head(results_list[["ko_or_bmt_vs_ctrl"]]))
+```

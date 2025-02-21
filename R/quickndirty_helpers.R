@@ -52,3 +52,50 @@ save_seurat_comps <- function(object, save_path){
     file.path(save_path, "metadata.csv")
   )
 }
+
+# for a given pair of idents, run FindMarkers()
+find_markers_for_pair <- function(
+    pair,
+    seurat_obj,
+    gene_of_interest = NULL,
+    min_pct = 0.25,
+    min_diff_pct = 0.1,
+    out_dir = "marker_outputs"
+) {
+  # make sure dir exists
+  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+  
+  # extract idents
+  ident1 <- pair[1]
+  ident2 <- pair[2]
+  
+  # Seurat::FindMarkers()
+  markers <- FindMarkers(
+    object = seurat_obj,
+    ident.1 = ident1,
+    ident.2 = ident2,
+    min.pct = min_pct,
+    min.diff.pct = min_diff_pct
+  )
+  
+  # export top100 markers
+  comp_label <- paste0(gsub(" ", "_", ident1), "_vs_", gsub(" ", "_", ident2))
+  csv_file <- file.path(out_dir, paste0("Top100Markers_", comp_label, ".csv"))
+  
+  top100 <- head(markers[order(markers$p_val_adj, decreasing = FALSE), ], 100)
+  write.csv(top100, file = csv_file)
+  
+  # if gene of interest present, export as well
+  if (!is.null(gene_of_interest) && gene_of_interest %in% rownames(markers)) {
+    fav_file <- file.path(out_dir, paste0("FavoriteGene_", gene_of_interest, "_", comp_label, ".txt"))
+    write.table(
+      markers[gene_of_interest, , drop = FALSE],
+      file = fav_file,
+      sep = "\t",
+      quote = FALSE,
+      col.names = NA
+    )
+  }
+  
+  return(markers)
+}
